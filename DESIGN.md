@@ -84,7 +84,12 @@ presenter.present(&mut r, /*capture*/ false)?;                    // or r.encode
 - **`DrawParams`**:
   - `world`.
   - `Material`: diffuse, ambient, emissive, each optionally taken from the vertex colour (like D3D material sources).
-  - `Lighting`: ambient plus up to 4 directional lights, Gouraud, `normalize`.
+  - `Lighting`: ambient plus up to 8 directional lights (`MAX_LIGHTS`, as Direct3D 8 hardware T&L), Gouraud, `normalize`.
+  - `RenderState::flat_shading`: each triangle takes its first vertex's colour (D3D SHADE_FLAT) on
+    every backend. OpenGL ES uses the last vertex for flat varyings and has no switch, so on GL a
+    flat-shaded draw's triangles are rotated on the CPU (strips and fans become lists).
+  - The per-draw block keeps its compact 720-byte layout for draws with up to 4 lights; lights 5-8
+    sit after it (848 bytes bound), and only draws that use them take the longer stride.
 - **`VertexLayout`**:
   - Semantics: `Position`, `PositionT` (screen-space XYZRHW), `Normal`, `Color`, `TexCoord(0..3)`, `BlendWeights`, `BlendIndices`.
   - Formats: F32x2/3/4, Unorm8x4, Unorm8x4Bgra (D3DCOLOR), U8x4, U16x4, Snorm16x2/4.
@@ -281,6 +286,9 @@ The full text is in `retro-wgpu/NOTICE.md`.
   6. A 32-bit `i686-pc-windows-msvc` build, if a hook DLL for the original game is planned.
 
 ## Tests
+
+`tests/lighting.rs`: 3 vs 8 lights in one frame in both orders (both block sizes), flat vs Gouraud
+shading.
 
 `cargo test` (add `--features slang` for stage 3). Every GPU test runs per backend, as `<test>::vulkan`, `::gl` and `::dx12` (Windows only). It checks pixels analytically and compares with `tests/golden/<name>-<backend>.png`. Those goldens were written by the tests on this machine. A comparison allows 0.5 % of pixels to differ by more than 2. `RETRO_WGPU_BLESS=1` rewrites them.
 

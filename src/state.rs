@@ -341,6 +341,9 @@ pub struct RenderState {
     pub alpha_test: AlphaTest,
     pub fog: Fog,
     pub stages: [Stage; STAGES],
+    /// Flat shading: each triangle takes its first vertex's colour (D3D SHADE_FLAT). A shader
+    /// switch, not part of the pipeline.
+    pub flat_shading: bool,
 }
 
 impl Default for RenderState {
@@ -359,6 +362,7 @@ impl Default for RenderState {
             alpha_test: AlphaTest::OFF,
             fog: Fog::OFF,
             stages: [Stage::OFF; STAGES],
+            flat_shading: false,
         }
     }
 }
@@ -401,7 +405,8 @@ pub struct DirLight {
     pub color: [f32; 3],
 }
 
-pub const MAX_LIGHTS: usize = 4;
+/// Eight, like Direct3D 8 hardware T&L devices.
+pub const MAX_LIGHTS: usize = 8;
 
 /// Per-vertex lighting: `emissive + ambient * mat.ambient + sum(max(N.-L, 0) * light * mat.diffuse)`,
 /// clamped to 0..1; alpha from the diffuse source.

@@ -9,8 +9,10 @@
 use crate::layout::{AttrFormat, Semantic, VertexLayout};
 use crate::state::*;
 
-/// Byte size of the per-draw uniform block (see `Draw` in CORE).
-pub(crate) const DRAW_BLOCK: usize = 720;
+/// Byte size of the per-draw uniform block (`DrawU` in CORE): what a draw block binds.
+pub(crate) const DRAW_BLOCK: usize = 848;
+/// Bytes of it that draws with at most 4 lights use (lights 5-8 sit after them), so those keep a compact stride.
+pub(crate) const DRAW_BLOCK_4: usize = 720;
 /// Byte size of the per-view uniform block.
 pub(crate) const VIEW_BLOCK: usize = 144;
 pub const MAX_BONES: usize = 64;
@@ -30,12 +32,15 @@ struct DrawU {
     fog_color: vec4<f32>,
     fog: vec4<f32>,
     stage_const: array<vec4<f32>, 4>,
-    // x: 1 lighting, 2 normalise, 4/8/16 diffuse/ambient/emissive from the vertex colour;
+    // x: 1 lighting, 2 normalise, 4/8/16 diffuse/ambient/emissive from the vertex colour, 32 flat shading;
     // y: light count; z: alpha compare (0 never .. 7 always); w: active stages.
     flags: vec4<u32>,
     alpha_ref: vec4<f32>,
     stage_ops: array<vec4<u32>, 4>,
     stage_coords: vec4<u32>,
+    // Lights 5-8, after the compact 4-light block (offset 720).
+    light_dir_hi: array<vec4<f32>, 4>,
+    light_color_hi: array<vec4<f32>, 4>,
 };
 @group(0) @binding(0) var<uniform> v: ViewU;
 @group(1) @binding(0) var<uniform> d: DrawU;
@@ -54,6 +59,7 @@ struct VOut {
     @location(1) uv01: vec4<f32>,
     @location(2) uv23: vec4<f32>,
     @location(3) fog: f32,
+    @location(4) @interpolate(flat) fcolor: vec4<f32>,
 };
 
 fn light(n: vec3<f32>, vcol: vec4<f32>) -> vec4<f32> {
@@ -65,8 +71,17 @@ fn light(n: vec3<f32>, vcol: vec4<f32>) -> vec4<f32> {
     let amb = select(d.mat_ambient, vcol, (f & 8u) != 0u && HAS_COLOR);
     let emi = select(d.mat_emissive, vcol, (f & 16u) != 0u && HAS_COLOR);
     var c = emi.rgb + d.ambient.rgb * amb.rgb;
-    for (var k = 0u; k < min(d.flags.y, 4u); k++) {
-        c += max(dot(n, -d.light_dir[k].xyz), 0.0) * d.light_color[k].rgb * diff.rgb;
+    for (var k = 0u; k < min(d.flags.y, 8u); k++) {
+        var ld: vec4<f32>;
+        var lc: vec4<f32>;
+        if (k < 4u) {
+            ld = d.light_dir[k];
+            lc = d.light_color[k];
+        } else {
+            ld = d.light_dir_hi[k - 4u];
+            lc = d.light_color_hi[k - 4u];
+        }
+        c += max(dot(n, -ld.xyz), 0.0) * lc.rgb * diff.rgb;
     }
     return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), diff.a);
 }
@@ -121,6 +136,7 @@ fn finish(p: vec4<f32>, n: vec3<f32>, vcol: vec4<f32>, uv: array<vec2<f32>, 4>) 
     let vn3 = (v.view * vec4<f32>(wn, 0.0)).xyz;
     let vn = select(vn3, normalize(vn3), dot(vn3, vn3) > 0.0);
     o.color = light(wn, vcol);
+    o.fcolor = o.color;
     o.uv01 = vec4<f32>(gen_coords(0u, vp.xyz, vn, uv), gen_coords(1u, vp.xyz, vn, uv));
     o.uv23 = vec4<f32>(gen_coords(2u, vp.xyz, vn, uv), gen_coords(3u, vp.xyz, vn, uv));
     o.fog = fog_factor(abs(vp.z));
@@ -134,6 +150,7 @@ fn finish_t(p: vec4<f32>, vcol: vec4<f32>, uv: array<vec2<f32>, 4>) -> VOut {
     let ndc = vec2<f32>((p.x + v.screen.z) / v.screen.x * 2.0 - 1.0, 1.0 - (p.y + v.screen.z) / v.screen.y * 2.0);
     o.pos = vec4<f32>(ndc * w, p.z * w, w);
     o.color = select(d.mat_diffuse, vcol, (d.flags.x & 4u) != 0u && HAS_COLOR);
+    o.fcolor = o.color;
     let z = vec3<f32>(0.0);
     o.uv01 = vec4<f32>(gen_coords(0u, z, z, uv), gen_coords(1u, z, z, uv));
     o.uv23 = vec4<f32>(gen_coords(2u, z, z, uv), gen_coords(3u, z, z, uv));
@@ -211,7 +228,7 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let x1 = textureSample(t1, s1, i.uv01.zw);
     let x2 = textureSample(t2, s2, i.uv23.xy);
     let x3 = textureSample(t3, s3, i.uv23.zw);
-    let diff = i.color;
+    let diff = select(i.color, i.fcolor, (d.flags.x & 32u) != 0u);
     var cur = diff;
     let n = d.flags.w;
     if (n > 0u) { cur = stage(0u, cur, diff, x0); }
@@ -343,10 +360,10 @@ fn arg_code(a: Arg) -> u32 {
         | if a.alpha { 32 } else { 0 }
 }
 
-/// The per-draw uniform block, as 32-bit words.
+/// The per-draw uniform block, as 32-bit words, and how many bytes of it the draw uses.
 pub(crate) type DrawBlock = [u32; DRAW_BLOCK / 4];
 
-pub(crate) fn draw_block(state: &RenderState, p: &DrawParams) -> DrawBlock {
+pub(crate) fn draw_block(state: &RenderState, p: &DrawParams) -> (DrawBlock, usize) {
     let mut b = [0u32; DRAW_BLOCK / 4];
     let mut put = |at: usize, v: &[f32]| {
         for (i, x) in v.iter().enumerate() {
@@ -369,8 +386,14 @@ pub(crate) fn draw_block(state: &RenderState, p: &DrawParams) -> DrawBlock {
         let d = light.direction;
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let d = if len > 0.0 { [d[0] / len, d[1] / len, d[2] / len] } else { d };
-        put(384 + k * 16, &[d[0], d[1], d[2], 0.0]);
-        put(448 + k * 16, &[light.color[0], light.color[1], light.color[2], 0.0]);
+        if k < 4 {
+            put(384 + k * 16, &[d[0], d[1], d[2], 0.0]);
+            put(448 + k * 16, &[light.color[0], light.color[1], light.color[2], 0.0]);
+        } else {
+            let hi = k - 4;
+            put(720 + hi * 16, &[d[0], d[1], d[2], 0.0]);
+            put(784 + hi * 16, &[light.color[0], light.color[1], light.color[2], 0.0]);
+        }
     }
     put(512, &state.fog.color);
     let fog = match state.fog.mode {
@@ -382,7 +405,7 @@ pub(crate) fn draw_block(state: &RenderState, p: &DrawParams) -> DrawBlock {
     put(528, &fog);
     put(624, &[(state.alpha_test.reference.clamp(0.0, 1.0) * 255.0).round(), 0.0, 0.0, 0.0]);
     let active = state.stages.iter().position(|s| s.color_op == Op::Disable).unwrap_or(STAGES) as u32;
-    let flags = (l.enabled as u32) | (l.normalize as u32) << 1 | (m.diffuse_from_vertex as u32) << 2 | (m.ambient_from_vertex as u32) << 3 | (m.emissive_from_vertex as u32) << 4;
+    let flags = (l.enabled as u32) | (l.normalize as u32) << 1 | (m.diffuse_from_vertex as u32) << 2 | (m.ambient_from_vertex as u32) << 3 | (m.emissive_from_vertex as u32) << 4 | (state.flat_shading as u32) << 5;
     b[608 / 4] = flags;
     b[612 / 4] = count as u32;
     b[616 / 4] = compare_code(state.alpha_test.compare);
@@ -401,7 +424,8 @@ pub(crate) fn draw_block(state: &RenderState, p: &DrawParams) -> DrawBlock {
             TexCoordSource::Position => 7,
         };
     }
-    b
+    let used = if count <= 4 { DRAW_BLOCK_4 } else { DRAW_BLOCK };
+    (b, used)
 }
 
 pub(crate) fn view_block(v: &View) -> [u32; VIEW_BLOCK / 4] {

@@ -12,7 +12,7 @@
 use crate::gpu::Gpu;
 use crate::layout::VertexLayout;
 use crate::post::{Blitter, OutputSettings, PostPass, ScaleFilter, TARGET_FORMAT, output_rect, render_texture};
-use crate::shader::{self, BONES_BLOCK, DRAW_BLOCK, MAX_BONES, VIEW_BLOCK};
+use crate::shader::{self, BONES_BLOCK, DRAW_BLOCK, DRAW_BLOCK_4, MAX_BONES, VIEW_BLOCK};
 use crate::state::*;
 use crate::texture::{Palette, TexFormat, full_chain, mip_chain, to_rgba8};
 use crate::fxhash::HashMap;
@@ -291,6 +291,8 @@ struct Rec<'a> {
     block: u32,
     prog: u32,
     inst: Option<(u32, u32)>,
+    /// Flat shading (GL then needs its triangles rotated, see `flat_list_for_last_vertex`).
+    flat: bool,
 }
 
 /// A draw with a program, without the fixed-function state a program ignores.
@@ -368,25 +370,34 @@ struct Blocks {
     bind: wgpu::BindGroup,
     stride: u64,
     capacity: usize,
-    size: u64,
+    /// Bytes a block uses (the stride is fitted to them) and bytes a binding covers.
+    used: usize,
+    bind_size: usize,
 }
 
 impl Blocks {
     fn new(gpu: &Gpu, layout: &wgpu::BindGroupLayout, size: usize, capacity: usize) -> Blocks {
-        let stride = (size as u64).next_multiple_of(gpu.device.limits().min_uniform_buffer_offset_alignment as u64);
-        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("blocks"), size: stride * capacity as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Blocks::with_binding(gpu, layout, size, size, capacity)
+    }
+
+    /// Blocks of `used` bytes at a stride fitted to them, each bound as `bind_size` bytes
+    /// (>= `used`; the rest overlaps the next block and is only read by blocks that fill it).
+    fn with_binding(gpu: &Gpu, layout: &wgpu::BindGroupLayout, used: usize, bind_size: usize, capacity: usize) -> Blocks {
+        let stride = (used as u64).next_multiple_of(gpu.device.limits().min_uniform_buffer_offset_alignment as u64);
+        let total = stride * capacity as u64 + bind_size as u64;
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("blocks"), size: total, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blocks"),
             layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &buffer, offset: 0, size: wgpu::BufferSize::new(size as u64) }) }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &buffer, offset: 0, size: wgpu::BufferSize::new(bind_size as u64) }) }],
         });
-        Blocks { buffer, bind, stride, capacity, size: size as u64 }
+        Blocks { buffer, bind, stride, capacity, used, bind_size }
     }
 
     /// Uploads `count` blocks already laid out at this buffer's stride.
     fn write_bytes(&mut self, gpu: &Gpu, layout: &wgpu::BindGroupLayout, bytes: &[u8], count: usize) {
         if count > self.capacity {
-            *self = Blocks::new(gpu, layout, self.size as usize, count.next_power_of_two());
+            *self = Blocks::with_binding(gpu, layout, self.used, self.bind_size, count.next_power_of_two());
         }
         if !bytes.is_empty() {
             gpu.queue.write_buffer(&self.buffer, 0, bytes);
@@ -529,7 +540,9 @@ pub struct Renderer {
     cmds: Vec<Cmd>,
     vdata: Vec<u8>,
     idata: Vec<u8>,
+    /// Fixed-function draw blocks: up to 4 lights (compact stride) and with 5-8 lights.
     draw_pool: ProgPool,
+    draw_pool8: ProgPool,
     view_pool: ProgPool,
     bone_pool: ProgPool,
     sent: Sent,
@@ -542,6 +555,7 @@ pub struct Renderer {
     istream: Stream,
     view_ub: Blocks,
     draw_ub: Blocks,
+    draw_ub8: Blocks,
     bones_ub: Blocks,
     scene: Option<SceneTarget>,
     /// Internal-resolution images: downsampled scene, post ping-pong.
@@ -576,6 +590,34 @@ fn as_bytes16(v: &[u16]) -> Vec<u8> {
 
 fn as_bytes32(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// `src` (indices of a triangle list, strip or fan) as a triangle list whose triangles are rotated
+/// (a, b, c) -> (b, c, a): same winding, but the first vertex becomes the last. OpenGL ES takes a
+/// flat-shaded triangle's colour from its last vertex, D3D and the other backends from its first.
+fn flat_list_for_last_vertex(topology: Topology, src: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let mut tri = |a: u32, b: u32, c: u32| out.extend([b, c, a]);
+    match topology {
+        Topology::TriangleList => src.chunks_exact(3).for_each(|t| tri(t[0], t[1], t[2])),
+        Topology::TriangleStrip => {
+            for i in 0..src.len().saturating_sub(2) {
+                // Triangle i's first (provoking) vertex is src[i]; odd triangles reverse the
+                // other two to keep the strip's winding.
+                if i % 2 == 0 {
+                    tri(src[i], src[i + 1], src[i + 2]);
+                } else {
+                    tri(src[i], src[i + 2], src[i + 1]);
+                }
+            }
+        }
+        Topology::TriangleFan => {
+            for i in 1..src.len().saturating_sub(1) {
+                tri(src[0], src[i], src[i + 1]);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Indices of a triangle fan as a triangle list.
@@ -666,7 +708,8 @@ impl Renderer {
             custom_output: None,
             blitter: std::cell::RefCell::new(Blitter::new(gpu)),
             view_ub: Blocks::new(gpu, &view_layout, VIEW_BLOCK, 16),
-            draw_ub: Blocks::new(gpu, &draw_layout, DRAW_BLOCK, 256),
+            draw_ub: Blocks::with_binding(gpu, &draw_layout, DRAW_BLOCK_4, DRAW_BLOCK, 256),
+            draw_ub8: Blocks::new(gpu, &draw_layout, DRAW_BLOCK, 16),
             bones_ub: Blocks::new(gpu, &bones_layout, BONES_BLOCK, 8),
             view_layout,
             draw_layout,
@@ -707,6 +750,7 @@ impl Renderer {
             vdata: Vec::new(),
             idata: Vec::new(),
             draw_pool: ProgPool::default(),
+            draw_pool8: ProgPool::default(),
             view_pool: ProgPool::default(),
             bone_pool: ProgPool::default(),
             sent: Sent::default(),
@@ -1096,7 +1140,14 @@ impl Renderer {
     /// Records a draw.
     pub fn draw(&mut self, gpu: &Gpu, d: &Draw) {
         let block = shader::draw_block(d.state, d.params);
-        let block = self.draw_pool.push(&[words(&block)], DRAW_BLOCK, self.draw_ub.stride as usize);
+        // Draws with at most 4 lights keep the compact block; more lights take the long ones
+        // (prog u32::MAX marks that pool).
+        let (block, used) = block;
+        let (block, prog) = if used <= DRAW_BLOCK_4 {
+            (self.draw_pool.push(&[&words(&block)[..DRAW_BLOCK_4]], DRAW_BLOCK_4, self.draw_ub.stride as usize), 0)
+        } else {
+            (self.draw_pool8.push(&[words(&block)], DRAW_BLOCK, self.draw_ub8.stride as usize), u32::MAX)
+        };
         let stages = std::array::from_fn(|i| (d.state.stages[i].texture, d.state.stages[i].sampler));
         self.record(
             gpu,
@@ -1115,8 +1166,9 @@ impl Renderer {
                 stages,
                 bones: d.bones,
                 block,
-                prog: 0,
+                prog,
                 inst: None,
+                flat: d.state.flat_shading,
             },
         );
     }
@@ -1197,6 +1249,8 @@ impl Renderer {
                 block,
                 prog: size,
                 inst,
+                // Programs do their own shading (and their own flat varyings).
+                flat: false,
             },
         );
     }
@@ -1223,8 +1277,9 @@ impl Renderer {
                 (VbRef::Buffer(id, off), (b.size.saturating_sub(off) / stride.max(1)) as u32)
             }
         };
-        // Indices (fans become lists).
-        let fan = d.topology == Topology::TriangleFan;
+        // Indices (fans become lists; flat-shaded triangles on GL become rotated lists).
+        let rotate = d.flat && gpu.backend == crate::Backend::Gl && matches!(d.topology, Topology::TriangleList | Topology::TriangleStrip | Topology::TriangleFan);
+        let fan = d.topology == Topology::TriangleFan || rotate;
         let mut ib = None;
         let (mut first, mut count);
         let indexed_count = match d.indices {
@@ -1251,7 +1306,11 @@ impl Renderer {
                 },
             };
             let mut list = std::mem::take(&mut self.scratch);
-            fan_to_list(&src, &mut list);
+            if rotate {
+                flat_list_for_last_vertex(d.topology, &src, &mut list);
+            } else {
+                fan_to_list(&src, &mut list);
+            }
             let at = self.idata.len();
             self.idata.extend(as_bytes32(&list));
             ib = Some(IbRef::Stream(at as u64, wgpu::IndexFormat::Uint32));
@@ -1285,7 +1344,8 @@ impl Renderer {
             Topology::LineList => wgpu::PrimitiveTopology::LineList,
             Topology::LineStrip => wgpu::PrimitiveTopology::LineStrip,
             Topology::TriangleList | Topology::TriangleFan => wgpu::PrimitiveTopology::TriangleList,
-            Topology::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
+            Topology::TriangleStrip if !rotate => wgpu::PrimitiveTopology::TriangleStrip,
+            Topology::TriangleStrip => wgpu::PrimitiveTopology::TriangleList,
         };
         let strip_index = match (topology, ib) {
             (wgpu::PrimitiveTopology::LineStrip | wgpu::PrimitiveTopology::TriangleStrip, Some(IbRef::Stream(_, f) | IbRef::Buffer(_, f))) => Some(f),
@@ -1530,6 +1590,7 @@ impl Renderer {
         self.istream.write(gpu, &self.idata);
         self.view_ub.write_bytes(gpu, &self.view_layout, &self.view_pool.bytes, self.view_pool.count as usize);
         self.draw_ub.write_bytes(gpu, &self.draw_layout, &self.draw_pool.bytes, self.draw_pool.count as usize);
+        self.draw_ub8.write_bytes(gpu, &self.draw_layout, &self.draw_pool8.bytes, self.draw_pool8.count as usize);
         self.bones_ub.write_bytes(gpu, &self.bones_layout, &self.bone_pool.bytes, self.bone_pool.count as usize);
         for (size, pool) in &self.prog_blocks {
             let ub = self.prog_ub.entry(*size).or_insert_with(|| Blocks::new(gpu, &self.draw_layout, *size as usize, 64));
@@ -1868,7 +1929,11 @@ impl Renderer {
                                 p.set_bind_group(1, bg, &[off, (d.inst as u64 * (d.inst_size as u64).next_multiple_of(self.ub_align)) as u32]);
                             }
                         } else {
-                            let ub = if d.prog != 0 { &self.prog_ub[&d.prog] } else { &self.draw_ub };
+                            let ub = match d.prog {
+                                0 => &self.draw_ub,
+                                u32::MAX => &self.draw_ub8,
+                                size => &self.prog_ub[&size],
+                            };
                             p.set_bind_group(1, &ub.bind, &[ub.offset(d.block)]);
                         }
                         bound.block = Some(block_key);
@@ -1965,6 +2030,7 @@ impl Renderer {
         self.vdata.clear();
         self.idata.clear();
         self.draw_pool.clear();
+        self.draw_pool8.clear();
         self.view_pool.clear();
         self.bone_pool.clear();
         self.sent = Sent::default();
@@ -2047,5 +2113,26 @@ impl VertexWriter {
     pub fn u16s(&mut self, v: &[u16]) -> &mut Self {
         self.bytes.extend(v.iter().flat_map(|x| x.to_le_bytes()));
         self
+    }
+}
+
+#[cfg(test)]
+mod flat_tests {
+    use super::*;
+
+    #[test]
+    fn rotated_lists_keep_the_first_vertex_last() {
+        let mut out = Vec::new();
+        flat_list_for_last_vertex(Topology::TriangleList, &[0, 1, 2, 3, 4, 5, 6], &mut out);
+        assert_eq!(out, [1, 2, 0, 4, 5, 3]);
+        flat_list_for_last_vertex(Topology::TriangleStrip, &[0, 1, 2, 3], &mut out);
+        assert_eq!(out, [1, 2, 0, 3, 2, 1]);
+        // Fans are drawn as lists of (centre, i, i + 1) on every backend: the centre leads.
+        flat_list_for_last_vertex(Topology::TriangleFan, &[0, 1, 2, 3], &mut out);
+        assert_eq!(out, [1, 2, 0, 2, 3, 0]);
+        flat_list_for_last_vertex(Topology::TriangleStrip, &[0, 1], &mut out);
+        assert!(out.is_empty());
+        flat_list_for_last_vertex(Topology::TriangleFan, &[], &mut out);
+        assert!(out.is_empty());
     }
 }
